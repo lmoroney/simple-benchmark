@@ -6,21 +6,18 @@ from collections import defaultdict
 from datetime import datetime
 
 # --- Configuration ---
-# Set the API endpoint for your server.
+# UPDATED: Matching your working curl command
 API_URL = "http://localhost:8001/v1/chat/completions"
 
-# Define the folder to save the results.
-OUTPUT_FOLDER = "benchmark_output"
+# UPDATED: Exact model name from your curl command
+MODEL_NAME = "openai/gpt-oss-120b"
 
-# Generate a unique filename with the current date and time
+OUTPUT_FOLDER = "benchmark_output"
 timestamp = datetime.now().strftime("%m_%d_%H%M")
 OUTPUT_FILE = os.path.join(OUTPUT_FOLDER, f"benchmark_results_{timestamp}.txt")
 
-# Define the number of requests to send for the benchmark.
-NUM_REQUESTS = 50  # Number of requests per category
+NUM_REQUESTS = 50 
 
-# Define categorized prompts for the benchmark.
-# Total requests will be 4 categories * 50 requests/category = 200 requests.
 CATEGORIZED_PROMPTS = {
     "information_retrieval": [
         "What is the capital of France?",
@@ -232,171 +229,131 @@ CATEGORIZED_PROMPTS = {
     ]
 }
 
-
 def run_benchmark():
-    """
-    Runs the benchmark by sending multiple requests and calculating metrics.
-    """
     print(f"Starting benchmark with {NUM_REQUESTS} requests per category...")
 
-    # Create the output directory if it doesn't exist.
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
         print(f"Created output folder: {OUTPUT_FOLDER}")
 
-    # A list to store metrics for all requests, regardless of category
     all_metrics = defaultdict(list)
-    # A dictionary to store the metrics for each category
     category_metrics_dict = {}
 
-    # Open the output file in write mode to clear previous content.
+    # Headers for local no-auth request
+    headers = {
+        "Content-Type": "application/json"
+    }
+
     with open(OUTPUT_FILE, "w") as f:
         f.write(f"--- Benchmark Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n\n")
 
-        # Loop through each category of prompts
         for category, prompts_list in CATEGORIZED_PROMPTS.items():
             f.write(f"--- Running Benchmark for Category: {category.replace('_', ' ').title()} ---\n\n")
             category_metrics = defaultdict(list)
 
-            # Loop to send each request in the current category
-            for i, prompt in enumerate(prompts_list):
+            # Limit prompts to NUM_REQUESTS
+            prompts_to_run = prompts_list[:NUM_REQUESTS]
 
-                # Update the request payload with the current prompt
+            for i, prompt in enumerate(prompts_to_run):
                 REQUEST_PAYLOAD = {
-                    "model": "openai/gpt-oss-120b",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": prompt
-                        }
-                    ],
+                    "model": MODEL_NAME,
+                    "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 100,
                     "stream": True
                 }
 
-                f.write(f"--- {category.replace('_', ' ').title()} Request {i+1}/{len(prompts_list)} ---\n")
-
-                # Record the start time of the entire request
+                f.write(f"--- {category.replace('_', ' ').title()} Request {i+1}/{len(prompts_to_run)} ---\n")
+                
                 start_total_time = time.time()
 
                 try:
-                    with requests.post(API_URL, json=REQUEST_PAYLOAD, stream=True) as response:
-                        response.raise_for_status()
+                    with requests.post(API_URL, headers=headers, json=REQUEST_PAYLOAD, stream=True) as response:
+                        
+                        if response.status_code != 200:
+                            f.write(f"API Error: Status Code {response.status_code}\n")
+                            f.write(f"Response: {response.text}\n")
+                            continue
 
                         first_token_time = None
                         tokens_count = 0
                         full_response_content = ""
 
                         for chunk in response.iter_lines(decode_unicode=True):
-                            if chunk.startswith("data: "):
+                            if chunk and chunk.startswith("data: "):
                                 json_data = chunk[len("data: "):]
                                 if json_data.strip() == "[DONE]":
                                     break
-
                                 try:
                                     data = json.loads(json_data)
-
-                                    # The content is sent in 'delta' chunks during streaming, not 'message'.
-                                    # This line now safely checks for 'delta' and retrieves the content.
-                                    content = data['choices'][0].get('delta', {}).get('content', '')
-
+                                    # Standard OpenAI stream format access
+                                    delta = data['choices'][0].get('delta', {})
+                                    content = delta.get('content', '')
+                                    
                                     if content:
                                         if first_token_time is None:
                                             first_token_time = time.time() - start_total_time
                                         full_response_content += content
                                         tokens_count += 1
                                 except (json.JSONDecodeError, KeyError) as e:
-                                    f.write(f"Error parsing JSON chunk: {e}\n")
+                                    # Log parse errors if necessary
+                                    pass
 
                         end_total_time = time.time()
                         total_time = end_total_time - start_total_time
 
-                        # Append metrics to both the category-specific and overall lists
-                        category_metrics['total_time'].append(total_time)
-                        category_metrics['completion_tokens'].append(tokens_count)
-                        all_metrics['total_time'].append(total_time)
-                        all_metrics['completion_tokens'].append(tokens_count)
+                        if first_token_time is not None:
+                            tps = tokens_count / total_time if total_time > 0 else 0
+                            
+                            category_metrics['total_time'].append(total_time)
+                            category_metrics['completion_tokens'].append(tokens_count)
+                            category_metrics['tokens_per_second'].append(tps)
+                            category_metrics['time_to_first_token'].append(first_token_time)
+                            
+                            all_metrics['total_time'].append(total_time)
+                            all_metrics['completion_tokens'].append(tokens_count)
+                            all_metrics['tokens_per_second'].append(tps)
+                            all_metrics['time_to_first_token'].append(first_token_time)
 
-                        tps = tokens_count / total_time if total_time > 0 else 0
-                        category_metrics['tokens_per_second'].append(tps)
-                        category_metrics['time_to_first_token'].append(first_token_time)
-                        all_metrics['tokens_per_second'].append(tps)
-                        all_metrics['time_to_first_token'].append(first_token_time)
-
-                        f.write(f"Prompt: {prompt}\n")
-                        f.write(f"Response: {full_response_content}\n")
-                        f.write(f"Time to First Token: {first_token_time:.4f} seconds\n")
-                        f.write(f"Total Request Time: {total_time:.4f} seconds\n")
-                        f.write(f"Completion Tokens: {tokens_count}\n")
-                        f.write(f"Tokens per Second (TPS): {tps:.2f}\n")
+                            f.write(f"Prompt: {prompt}\n")
+                            f.write(f"Response: {full_response_content}\n")
+                            f.write(f"Time to First Token: {first_token_time:.4f} seconds\n")
+                            f.write(f"Total Request Time: {total_time:.4f} seconds\n")
+                            f.write(f"Completion Tokens: {tokens_count}\n")
+                            f.write(f"Tokens per Second (TPS): {tps:.2f}\n")
+                        else:
+                            f.write(f"Prompt: {prompt}\n")
+                            f.write("Status: Request succeeded (200 OK) but NO tokens generated (Empty Response).\n")
+                        
                         f.write("-" * 20 + "\n")
 
                 except requests.exceptions.RequestException as e:
                     f.write(f"Error during request: {e}\n")
                     continue
 
-            # Store the metrics for the current category
             category_metrics_dict[category] = category_metrics
 
-        # --- Calculate and print the summary for each category ---
-        for category, metrics in category_metrics_dict.items():
-            f.write(f"\n--- Summary Benchmark Results for {category.replace('_', ' ').title()} ---\n")
-            if metrics['total_time']:
-                avg_total_time = sum(metrics['total_time']) / len(metrics['total_time'])
-                min_total_time = min(metrics['total_time'])
-                max_total_time = max(metrics['total_time'])
-
-                avg_tokens_per_second = sum(metrics['tokens_per_second']) / len(metrics['tokens_per_second'])
-                min_tokens_per_second = min(metrics['tokens_per_second'])
-                max_tokens_per_second = max(metrics['tokens_per_second'])
-
-                avg_time_to_first_token = sum(metrics['time_to_first_token']) / len(metrics['time_to_first_token'])
-                min_time_to_first_token = min(metrics['time_to_first_token'])
-                max_time_to_first_token = max(metrics['time_to_first_token'])
-
-                f.write(f"Average Time to First Token: {avg_time_to_first_token:.4f} seconds\n")
-                f.write(f"Min Time to First Token: {min_time_to_first_token:.4f} seconds\n")
-                f.write(f"Max Time to First Token: {max_time_to_first_token:.4f} seconds\n")
-                f.write(f"Average Total Request Time: {avg_total_time:.4f} seconds\n")
-                f.write(f"Min Total Request Time: {min_total_time:.4f} seconds\n")
-                f.write(f"Max Total Request Time: {max_total_time:.4f} seconds\n")
-                f.write(f"Average Tokens per Second (TPS): {avg_tokens_per_second:.2f}\n")
-                f.write(f"Min Tokens per Second (TPS): {min_tokens_per_second:.2f}\n")
-                f.write(f"Max Tokens per Second (TPS): {max_tokens_per_second:.2f}\n\n")
+        # --- Summaries ---
+        def print_metrics(metrics_dict, title):
+            f.write(f"\n--- {title} ---\n")
+            if metrics_dict['total_time']:
+                avg_ttft = sum(metrics_dict['time_to_first_token']) / len(metrics_dict['time_to_first_token'])
+                avg_tps = sum(metrics_dict['tokens_per_second']) / len(metrics_dict['tokens_per_second'])
+                avg_total = sum(metrics_dict['total_time']) / len(metrics_dict['total_time'])
+                
+                f.write(f"Avg Time to First Token: {avg_ttft:.4f}s\n")
+                f.write(f"Avg Tokens per Second:   {avg_tps:.2f}\n")
+                f.write(f"Avg Total Request Time:  {avg_total:.4f}s\n")
+                f.write(f"Max TPS: {max(metrics_dict['tokens_per_second']):.2f}\n")
+                f.write(f"Min TPS: {min(metrics_dict['tokens_per_second']):.2f}\n")
             else:
-                f.write("No successful requests were made for this category.\n\n")
+                f.write("No successful requests recorded.\n")
 
-        # --- Calculate and print the final results for all prompts ---
-        if not all_metrics['total_time']:
-            f.write("\nNo successful requests were made.")
-            print("\nNo successful requests were made.")
-            return
+        for category, metrics in category_metrics_dict.items():
+            print_metrics(metrics, f"Summary: {category.replace('_', ' ').title()}")
 
-        avg_total_time = sum(all_metrics['total_time']) / len(all_metrics['total_time'])
-        min_total_time = min(all_metrics['total_time'])
-        max_total_time = max(all_metrics['total_time'])
-
-        avg_tokens_per_second = sum(all_metrics['tokens_per_second']) / len(all_metrics['tokens_per_second'])
-        min_tokens_per_second = min(all_metrics['tokens_per_second'])
-        max_tokens_per_second = max(all_metrics['tokens_per_second'])
-
-        avg_time_to_first_token = sum(all_metrics['time_to_first_token']) / len(all_metrics['time_to_first_token'])
-        min_time_to_first_token = min(all_metrics['time_to_first_token'])
-        max_time_to_first_token = max(all_metrics['time_to_first_token'])
-
-        f.write("\n--- Overall Benchmark Results (All Categories Combined) ---\n")
-        f.write(f"Average Time to First Token: {avg_time_to_first_token:.4f} seconds\n")
-        f.write(f"Min Time to First Token: {min_time_to_first_token:.4f} seconds\n")
-        f.write(f"Max Time to First Token: {max_time_to_first_token:.4f} seconds\n")
-        f.write(f"Average Total Request Time: {avg_total_time:.4f} seconds\n")
-        f.write(f"Min Total Request Time: {min_total_time:.4f} seconds\n")
-        f.write(f"Max Total Request Time: {max_total_time:.4f} seconds\n")
-        f.write(f"Average Tokens per Second (TPS): {avg_tokens_per_second:.2f}\n")
-        f.write(f"Min Tokens per Second (TPS): {min_tokens_per_second:.2f}\n")
-        f.write(f"Max Tokens per Second (TPS): {max_tokens_per_second:.2f}\n")
+        print_metrics(all_metrics, "Overall Benchmark Results")
 
     print(f"\nBenchmark completed. Results saved to '{OUTPUT_FILE}'.")
-
 
 if __name__ == "__main__":
     run_benchmark()
